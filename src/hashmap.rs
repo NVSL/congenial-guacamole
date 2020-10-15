@@ -192,11 +192,11 @@ where
         );
     }
 
-    pub fn foreach<F: FnMut(&K, &V) -> ()>(&self, mut f: F) where V: Copy {
+    pub fn foreach<F: FnMut(&K, &V) -> ()>(&self, mut f: F) {
         for i in 0..BUCKETS_MAX {
             for e in &*self.buckets[i].borrow() {
                 let e = e.borrow();
-                f(&e.0, &self.values[e.1].get());
+                f(&e.0, self.values[e.1].get_ref());
             }
         }
     }

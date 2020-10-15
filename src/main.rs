@@ -263,25 +263,21 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, data: &Database
             };
             if let Ok(done) = res {
                 if done {
-                    let users = users.read().await;
-                    let users = AssertTxInSafe(users);
                     if let Ok(msg) = P::transaction(|j| {
                         let mut global_history = BTreeMap::<SystemTime, Value>::new();
-                        for (&id, _) in users.iter() {
-                            if let Some(data) = data.unpack(j) {
-                                if let Some(data) = data.lock(j).get_ref(id) {
-                                    let mut curr = data.history.head();
-                                    let last = data.history.last_timestamp(j);
-                                    while let Some(item) = curr.upgrade(j) {
-                                        if item.timestamp() <= last {
-                                            global_history.insert(item.timestamp(), item.as_json());
-                                        } else {
-                                            break;
-                                        }
-                                        curr = item.next();
+                        if let Some(data) = data.unpack(j) {
+                            data.lock(j).foreach(|_, data| {
+                                let mut curr = data.history.head();
+                                let last = data.history.last_timestamp(j);
+                                while let Some(item) = curr.upgrade(j) {
+                                    if item.timestamp() <= last {
+                                        global_history.insert(item.timestamp(), item.as_json());
+                                    } else {
+                                        break;
                                     }
+                                    curr = item.next();
                                 }
-                            }
+                            });
                         }
                         let mut lst = vec![];
                         for (_, item) in global_history {
@@ -293,7 +289,7 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, data: &Database
                         }))
                         .unwrap()
                     }) {
-                        for (_, tx) in users.iter() {
+                        for (_, tx) in users.read().await.iter() {
                             if let Err(disconnected) = tx.send(Ok(Message::text(msg.clone()))) {
                                 eprintln!("User<#{}> is disconnected!", disconnected);
                             }
