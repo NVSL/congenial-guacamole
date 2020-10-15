@@ -43,8 +43,9 @@ static COLOR_PALLETE: [u32; 8] = [
     color(64, 64, 64),
 ];
 
-static HOST_IP: [u8;4] = [10, 1, 1, 62];
-static HOST_PORT: u16 = 3030;
+static SOCKET: [u8;4] = [127, 0, 0, 1];
+// static SOCKET: [u8;4] = [10, 1, 1, 62];
+static PORT: u16 = 3030;
 
 struct UserInfo {
     name: PString<P>,
@@ -101,7 +102,7 @@ async fn main() {
 
     let routes = index.or(chat);
 
-    warp::serve(routes).run((HOST_IP, HOST_PORT)).await;
+    warp::serve(routes).run((SOCKET, PORT)).await;
 }
 
 async fn user_connected(ws: WebSocket, users: Users, data: DatabasePack) {
