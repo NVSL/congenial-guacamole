@@ -43,6 +43,9 @@ static COLOR_PALLETE: [u32; 8] = [
     color(64, 64, 64),
 ];
 
+static HOST_IP: [u8;4] = [10, 1, 1, 62];
+static HOST_PORT: u16 = 3030;
+
 struct UserInfo {
     name: PString<P>,
     pass: PString<P>,
@@ -98,7 +101,7 @@ async fn main() {
 
     let routes = index.or(chat);
 
-    warp::serve(routes).run(([10, 1, 1, 62], 3030)).await;
+    warp::serve(routes).run((HOST_IP, HOST_PORT)).await;
 }
 
 async fn user_connected(ws: WebSocket, users: Users, data: DatabasePack) {
@@ -241,15 +244,17 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, data: &Database
             }) {
                 eprintln!("Error: {}", e);
             }
-        } else if cmd == "undo" || cmd == "redo" || cmd == "redraw" {
+        } else if cmd == "undo" || cmd == "redo" || cmd == "redraw" || cmd == "clear" {
             let res = if cmd == "redraw" {
                 Ok(true)
             } else {
-                    P::transaction(|j| {
+                P::transaction(|j| {
                     let mut done = false;
                     if let Some(data) = data.unpack(j) {
                         if !data.lock(j).update_inplace(&my_id, |w| {
-                            done = if cmd == "undo" {
+                            done = if cmd == "clear" {
+                                w.history.clear()
+                            } else if cmd == "undo" {
                                 w.history.undo()
                             } else {
                                 w.history.redo()
@@ -364,6 +369,7 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
                 <input type="color" id="cbox" name="cbox" value="\#000000">
                 <input type="button" id="undo" name="undo" class="material-icons" value="undo">
                 <input type="button" id="redo" name="redo" class="material-icons" value="redo">
+                <input type="button" id="clear" name="clear" class="material-icons" value="delete">
                 <br>
                 <canvas id="drawCanvas" width="800" height="600"
                 style="border:1px solid #000000;"></canvas>
@@ -466,6 +472,11 @@ static INDEX_HTML: &str = r#"<!DOCTYPE html>
             redo.addEventListener('click', function(e) {
                 ws.send(JSON.stringify({
                     type: "redo",
+                }));
+            }, false);
+            clear.addEventListener('click', function(e) {
+                ws.send(JSON.stringify({
+                    type: "clear",
                 }));
             }, false);
 

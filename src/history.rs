@@ -132,6 +132,17 @@ impl History {
         }).unwrap()
     }
 
+    pub fn clear(&self) -> bool {
+        P::transaction(|j| {
+            let mut current = self.current.borrow_mut(j);
+            let mut head  = self.head.borrow_mut(j);
+            let res = head.is_some();
+            *head = None;
+            *current = Weak::new();
+            res
+        }).unwrap()
+    }
+
     pub fn head(&self) -> VWeak<Line,P> {
         if let Some(head) = &*self.head.borrow() {
             head.volatile()
