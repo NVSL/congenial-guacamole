@@ -119,8 +119,8 @@ async fn main() {
     let info = P::open::<Root>("users.pool", PO_CFNE | PO_2GB).unwrap();
     let pack = info.pack();
     let db = warp::any().map(move || pack.clone());
-    // GET /chat -> websocket upgrade
-    let chat = warp::path("chat")
+    // GET /wb -> websocket upgrade
+    let wb = warp::path("wb")
         // The `ws()` filter will prepare Websocket handshake...
         .and(warp::ws())
         .and(users)
@@ -135,9 +135,9 @@ async fn main() {
         std::fs::read_to_string("wb.html")
         .expect("Something went wrong reading the file")));
 
-    let routes = index.or(chat);
+    let routes = index.or(wb);
 
-    let server = read_user_from_file("public_html/server.json")
+    let server = read_user_from_file("login/server.json")
         .expect("server.json does not exist");
     let arr: Vec<&str> = server.host.split(".").collect();
     let host: [u8; 4] = [
@@ -147,6 +147,8 @@ async fn main() {
         arr[3].parse().unwrap()
         ];
 
+    eprintln!("WebSocket is running at {}:{}", server.host, server.port);
+
     warp::serve(routes).run((host, server.port)).await;
 }
 
@@ -155,7 +157,7 @@ async fn user_connected(ws: WebSocket, users: Users, root: RootPack) {
     let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
     let mut user_id: [u8; 16] = [0; 16];
 
-    eprintln!("new chat user: {}", my_id);
+    eprintln!("new user: {}", my_id);
 
     // Split the socket into a sender and receive of messages.
     let (user_ws_tx, mut user_ws_rx) = ws.split();
