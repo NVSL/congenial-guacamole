@@ -136,20 +136,13 @@
 	<script src="js/main.js"></script>
 
 	<script type="text/javascript">
-		const chat = document.getElementById('chat');
 		const text = document.getElementById('text');
 		const uri = "<?php 
 			$cnf = json_decode(file_get_contents('./server.json'), true);
 			$server = $cnf["host"] . ':' . $cnf["port"];
-			echo 'ws://' . $server . '/chat';
+			echo 'ws://' . $server . '/wb';
 		?>";
 		var connected = false;
-
-		function say(user, content) {
-			const line = document.createElement('p');
-			line.innerText = `${user}: ${content}`;
-			chat.appendChild(line);
-		}
 
 		var ws;
 

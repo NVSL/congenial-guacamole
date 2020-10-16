@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
     <head>
-        <title>Whiteboard &amp; Chat</title>
+        <title>Whiteboard</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
         <style>
@@ -48,9 +48,8 @@
         </div>
         <div id="overlay"><div id="connecting">Connecting ...</div></div>
         <script type="text/javascript">
-            const chat = document.getElementById('chat');
             const text = document.getElementById('text');
-            const uri = 'ws://' + location.host + '/chat';
+            const uri = 'ws://' + location.host + '/wb';
             var connected = false;
 
             var urlParams = new URLSearchParams(window.location.search);
