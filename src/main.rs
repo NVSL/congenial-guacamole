@@ -1,5 +1,8 @@
 // #![deny(warnings)]
 #![allow(dead_code)]
+use std::path::Path;
+use std::io::BufReader;
+use std::fs::File;
 use futures::{FutureExt, StreamExt};
 use pmem::alloc::*;
 use pmem::stm::Journal;
@@ -19,6 +22,9 @@ use std::time::SystemTime;
 use tokio::sync::{mpsc, RwLock};
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
+use md5::*;
+use hex::*;
+use serde::*;
 
 mod hashmap;
 mod history;
@@ -43,13 +49,15 @@ static COLOR_PALLETE: [u32; 8] = [
     color(64, 64, 64),
 ];
 
-static SOCKET: [u8;4] = [127, 0, 0, 1];
-// static SOCKET: [u8;4] = [10, 1, 1, 62];
-static PORT: u16 = 3030;
+#[derive(Deserialize, Debug)]
+struct Server {
+    host: String,
+    port: u16
+}
 
 struct UserInfo {
-    name: PString<P>,
-    pass: PString<P>,
+    username: PString<P>,
+    password: [u8; 16],
     color: u32,
     history: History,
 }
@@ -57,8 +65,8 @@ struct UserInfo {
 impl RootObj<P> for UserInfo {
     fn init(j: &Journal<P>) -> Self {
         UserInfo {
-            name: Default::default(),
-            pass: Default::default(),
+            username: Default::default(),
+            password: Default::default(),
             color: 0,
             history: RootObj::init(j),
         }
@@ -70,8 +78,33 @@ impl RootObj<P> for UserInfo {
 /// - Key is their id
 /// - Value is a sender of `warp::ws::Message`
 type Users = Arc<RwLock<HashMap<usize, mpsc::UnboundedSender<Result<Message, warp::Error>>>>>;
-type Database = Parc<PMutex<PHashMap<usize, UserInfo>, P>, P>;
-type DatabasePack = Pack<PMutex<PHashMap<usize, UserInfo>, P>, P>;
+
+struct Database {
+    data: PHashMap<[u8; 16], UserInfo>
+}
+
+impl RootObj<P> for Database {
+    fn init(j: &Journal<P>) -> Self {
+        Database {
+            data: RootObj::init(j)
+        }
+    }
+}
+
+type Root = Parc<PMutex<Database, P>, P>;
+type RootPack = Pack<PMutex<Database, P>, P>;
+
+fn read_user_from_file<P: AsRef<Path>>(path: P) -> Result<Server, Box<dyn std::error::Error>> {
+    // Open the file in read-only mode with buffer.
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    // Read the JSON contents of the file as an instance of `User`.
+    let u = serde_json::from_reader(reader)?;
+
+    // Return the `User`.
+    Ok(u)
+}
 
 #[tokio::main]
 async fn main() {
@@ -83,7 +116,7 @@ async fn main() {
     // Turn our "state" into a new Filter...
     let users = warp::any().map(move || users.clone());
 
-    let info = P::open::<Database>("users.pool", PO_CFNE | PO_2GB).unwrap();
+    let info = P::open::<Root>("users.pool", PO_CFNE | PO_2GB).unwrap();
     let pack = info.pack();
     let db = warp::any().map(move || pack.clone());
     // GET /chat -> websocket upgrade
@@ -98,16 +131,29 @@ async fn main() {
         });
 
     // GET / -> index html
-    let index = warp::path::end().map(|| warp::reply::html(INDEX_HTML));
+    let index = warp::path::end().map(|| warp::reply::html(
+        std::fs::read_to_string("wb.html")
+        .expect("Something went wrong reading the file")));
 
     let routes = index.or(chat);
 
-    warp::serve(routes).run((SOCKET, PORT)).await;
+    let server = read_user_from_file("public_html/server.json")
+        .expect("server.json does not exist");
+    let arr: Vec<&str> = server.host.split(".").collect();
+    let host: [u8; 4] = [
+        arr[0].parse().unwrap(),
+        arr[1].parse().unwrap(),
+        arr[2].parse().unwrap(),
+        arr[3].parse().unwrap()
+        ];
+
+    warp::serve(routes).run((host, server.port)).await;
 }
 
-async fn user_connected(ws: WebSocket, users: Users, data: DatabasePack) {
+async fn user_connected(ws: WebSocket, users: Users, root: RootPack) {
     // Use a counter to assign a new unique ID for this user.
     let my_id = NEXT_USER_ID.fetch_add(1, Ordering::Relaxed);
+    let mut user_id: [u8; 16] = [0; 16];
 
     eprintln!("new chat user: {}", my_id);
 
@@ -126,23 +172,6 @@ async fn user_connected(ws: WebSocket, users: Users, data: DatabasePack) {
     // Save the sender in our list of connected users.
     users.write().await.insert(my_id, tx);
 
-    // Save the sender's name in our list of connected users, if not already set.
-    P::transaction(|j| {
-        if let Some(data) = data.unpack(j) {
-            data.lock(j).or_insert(
-                &my_id,
-                UserInfo {
-                    name: format!("User<#{}>", my_id).to_pstring(j),
-                    pass: "0000".to_pstring(j),
-                    color: COLOR_PALLETE[(my_id - 1) % 8],
-                    history: RootObj::init(j),
-                },
-                j,
-            );
-        }
-    })
-    .unwrap();
-
     // Return a `Future` that is basically a state machine managing
     // this specific user's connection.
 
@@ -159,7 +188,7 @@ async fn user_connected(ws: WebSocket, users: Users, data: DatabasePack) {
                 break;
             }
         };
-        user_message(my_id, msg, &users, &data).await;
+        user_id = user_message(my_id, user_id, msg, &users, &root).await;
     }
 
     // user_ws_rx stream will keep processing as long as the user stays
@@ -167,92 +196,116 @@ async fn user_connected(ws: WebSocket, users: Users, data: DatabasePack) {
     user_disconnected(my_id, &users2).await;
 }
 
-async fn user_message(my_id: usize, msg: Message, users: &Users, data: &DatabasePack) {
+async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users, root: &RootPack) -> [u8; 16] {
     // Skip any non-Text messages...
     let msg = if let Ok(s) = msg.to_str() {
         s
     } else {
-        return;
+        return [0; 16];
     };
 
     if let Ok(v) = serde_json::from_str(msg) as Rslt<Value> {
         let cmd = &v["type"];
-        if cmd == "get_id" {
-            let tx = &users.read().await[&my_id];
-            if let Err(disconnected) = tx.send(Ok(Message::text(format!(
-                "{{ \"user\": \"{}\", \"type\": \"my_id\" }}",
-                my_id
-            )))) {
-                eprintln!("User<#{}> is disconnected!", disconnected);
-            }
-        } else if cmd == "get_name" {
+        if cmd == "login" || cmd == "new_user" {
+            // Save the sender's name in our list of connected users, if not already set.
             let tx = &users.read().await[&my_id];
             let tx = AssertTxInSafe(tx);
-            if let Err(e) = P::transaction(|j| {
-                if let Some(data) = data.unpack(j) {
-                    if let Some(r) = data.lock(j).get_ref(my_id) {
+            return P::transaction(|j| {
+                if let Some(root) = root.unpack(j) {
+                    let mut root = root.lock(j);
+                    let name = v["username"].as_str().unwrap();
+                    let pass = v["password"].as_str().unwrap();
+                    let password = *compute(pass);
+
+                    println!("received user: {}", name);
+                    println!("received pass: {:?}", pass);
+                    let user_id = *compute(name);
+                    if let Some(u) = root.data.get_ref(user_id) {
+                        if u.password == password {
+                            println!("Logged in");
+                            if let Err(disconnected) = tx.send(Ok(Message::text(format!(
+                                "{{\"type\": \"login\", \"user\": \"{}\", \"name\": \"{}\", \"color\": \"{}\"}}",
+                                user.encode_hex::<String>(), u.username, u.color
+                            )))) {
+                                eprintln!("User<#{}> is disconnected!", disconnected);
+                            }
+                            user_id
+                        } else {
+                            println!("Wrong password");
+                            if let Err(disconnected) = tx.send(Ok(Message::text(format!(
+                                "{{\"type\": \"wrong\"}}"
+                            )))) {
+                                eprintln!("User<#{}> is disconnected!", disconnected);
+                            }
+                            [0; 16]
+                        }
+                    } else if cmd == "new_user" {
+                        root.data.put(
+                            user_id,
+                            UserInfo {
+                                username: name.to_pstring(j),
+                                password,
+                                color: COLOR_PALLETE[(my_id - 1) % 8],
+                                history: RootObj::init(j),
+                            },
+                            j,
+                        );
+                        user_id
+                    } else {
+                        println!("User doesn't exist");
                         if let Err(disconnected) = tx.send(Ok(Message::text(format!(
-                            "{{ \"user\": \"{}\",
-                        \"type\": \"my_name\", \"data\": \"{}\" }}",
-                            my_id, r.name
+                            "{{\"type\": \"not_exists\"}}"
                         )))) {
                             eprintln!("User<#{}> is disconnected!", disconnected);
                         }
+                        [0; 16]
                     }
+                } else {
+                    user
                 }
-            }) {
-                eprintln!("Error: {}", e);
-            }
-        } else if cmd == "get_color" {
+            })
+            .unwrap();
+        } else if cmd == "set_user" {
+            let user = *compute(v["data"].as_str().unwrap());
             let tx = &users.read().await[&my_id];
             let tx = AssertTxInSafe(tx);
-            if let Err(e) = P::transaction(|j| {
-                if let Some(data) = data.unpack(j) {
-                    if let Some(r) = data.lock(j).get_ref(my_id) {
-                        if let Err(disconnected) = tx.send(Ok(Message::text(format!(
-                            "{{ \"user\": \"{}\",
-                        \"type\": \"my_color\", \"data\": {} }}",
-                            my_id, r.color
-                        )))) {
-                            eprintln!("User<#{}> is disconnected!", disconnected);
-                        }
-                    }
-                }
+            match P::transaction(|j| {
+                if let Some(root) = root.unpack(j) {
+                    if let Some(u) = root.lock(j).data.get_ref(user) {
+                        u.color
+                    } else { 0 }
+                } else { 0 }
             }) {
-                eprintln!("Error: {}", e);
-            }
-        } else if cmd == "set_name" {
-            if let Err(e) = P::transaction(|j| {
-                if let Some(data) = data.unpack(j) {
-                    if !data.lock(j).update_inplace_mut(&my_id, j, |w| {
-                        w.name = v["data"].to_pstring(j);
-                    }) {
-                        eprintln!("User<#{}> does not exist!", my_id);
-                    }
+                Err(e) => eprintln!("Error: {}", e),
+                Ok(c) => {
+                    let _ = tx.send(Ok(Message::text(
+                        serde_json::to_string(&json!({
+                            "type": "my_color",
+                            "data": c
+                        })).unwrap())));
                 }
-            }) {
-                eprintln!("Error: {}", e);
             }
+            return user;
         } else if cmd == "set_color" {
             if let Err(e) = P::transaction(|j| {
-                if let Some(data) = data.unpack(j) {
+                if let Some(root) = root.unpack(j) {
                     let s = &v["data"].as_str().unwrap()[1..];
                     let c = u32::from_str_radix(s, 16).unwrap();
-                    if !data.lock(j).update_inplace_mut(&my_id, j, |w| w.color = c) {
-                        eprintln!("User<#{}> does not exist!", my_id);
+                    if !root.lock(j).data.update_inplace_mut(&user, j, |w| w.color = c) {
+                        eprintln!("User does not exist!");
                     }
                 }
             }) {
                 eprintln!("Error: {}", e);
             }
-        } else if cmd == "undo" || cmd == "redo" || cmd == "redraw" || cmd == "clear" {
-            let res = if cmd == "redraw" {
+        } else if cmd == "undo" || cmd == "redo" || cmd == "redraw" || cmd == "clear" || cmd == "refresh" {
+            let res = if cmd == "redraw" || cmd == "refresh" {
                 Ok(true)
             } else {
                 P::transaction(|j| {
                     let mut done = false;
-                    if let Some(data) = data.unpack(j) {
-                        if !data.lock(j).update_inplace(&my_id, |w| {
+                    if let Some(root) = root.unpack(j) {
+                        if !root.lock(j).data.update_inplace(&user, |w| {
                             done = if cmd == "clear" {
                                 w.history.clear()
                             } else if cmd == "undo" {
@@ -261,7 +314,7 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, data: &Database
                                 w.history.redo()
                             };
                         }) {
-                            eprintln!("User<#{}> does not exist!", my_id);
+                            eprintln!("User does not exist!");
                         }
                     }
                     done
@@ -271,10 +324,10 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, data: &Database
                 if done {
                     if let Ok(msg) = P::transaction(|j| {
                         let mut global_history = BTreeMap::<SystemTime, Value>::new();
-                        if let Some(data) = data.unpack(j) {
-                            data.lock(j).foreach(|_, data| {
-                                let mut curr = data.history.head();
-                                let last = data.history.last_timestamp(j);
+                        if let Some(root) = root.unpack(j) {
+                            root.lock(j).data.foreach(|_, root| {
+                                let mut curr = root.history.head();
+                                let last = root.history.last_timestamp(j);
                                 while let Some(item) = curr.upgrade(j) {
                                     if item.timestamp() <= last {
                                         global_history.insert(item.timestamp(), item.as_json());
@@ -295,9 +348,12 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, data: &Database
                         }))
                         .unwrap()
                     }) {
-                        for (_, tx) in users.read().await.iter() {
-                            if let Err(disconnected) = tx.send(Ok(Message::text(msg.clone()))) {
-                                eprintln!("User<#{}> is disconnected!", disconnected);
+                        let to_all = cmd != "refresh";
+                        for (&id, tx) in users.read().await.iter() {
+                            if to_all || id == my_id {
+                                if let Err(disconnected) = tx.send(Ok(Message::text(msg.clone()))) {
+                                    eprintln!("User<#{}> is disconnected!", disconnected);
+                                }
                             }
                         }
                     }
@@ -317,15 +373,15 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, data: &Database
                             ));
                         }
                         if let Err(e) = P::transaction(|j| {
-                            if let Some(data) = data.unpack(j) {
-                                let info = data.lock(j);
-                                let c = if let Some(r) = info.get_ref(my_id) {
+                            if let Some(root) = root.unpack(j) {
+                                let root = root.lock(j);
+                                let c = if let Some(r) = root.data.get_ref(user) {
                                     r.color
                                 } else {
                                     0
                                 };
-                                if !info.update_inplace(&my_id, |w| w.history.add(j, &arr, c)) {
-                                    eprintln!("User<#{}> does not exist!", my_id);
+                                if !root.data.update_inplace(&user, |w| w.history.add(j, &arr, c)) {
+                                    eprintln!("User does not exist!");
                                 }
                             }
                         }) {
@@ -348,6 +404,7 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, data: &Database
     } else {
         eprintln!("received data is not a json object!");
     }
+    user
 }
 
 async fn user_disconnected(my_id: usize, users: &Users) {
@@ -356,195 +413,3 @@ async fn user_disconnected(my_id: usize, users: &Users) {
     // Stream closed up, so remove from the user list
     users.write().await.remove(&my_id);
 }
-
-static INDEX_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
-    <head>
-        <title>Whiteboard &amp; Chat</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
-    </head>
-    <body>
-        <div class="container" style="display: flex; height: 100px;">
-            <div style="width: 80%;">
-                <input type="color" id="cbox" name="cbox" value="\#000000">
-                <input type="button" id="undo" name="undo" class="material-icons" value="undo">
-                <input type="button" id="redo" name="redo" class="material-icons" value="redo">
-                <input type="button" id="clear" name="clear" class="material-icons" value="delete">
-                <br>
-                <canvas id="drawCanvas" width="800" height="600"
-                style="border:1px solid #000000;"></canvas>
-            </div>
-            <div style="flex-grow: 1;">
-                <h1>Chat</h1>
-                <div id="chat">
-                    <p><em>Connecting...</em></p>
-                </div>
-                <input type="text" id="text" />
-                <button type="button" id="send">Send</button>
-            </div>
-        </div>
-        <script type="text/javascript">
-            const chat = document.getElementById('chat');
-            const text = document.getElementById('text');
-            const uri = 'ws://' + location.host + '/chat';
-            var connected = false;
-
-            function say(user, content) {
-                const line = document.createElement('p');
-                line.innerText = `${user}: ${content}`;
-                chat.appendChild(line);
-            }
-
-            var ws;
-            var name;
-            var color = '#000000';
-
-            function message(data) {
-                var msg = JSON.parse(data);
-                if (msg.type == 'text') {
-                    say(msg.name, msg.data);
-                } else if (msg.type == 'my_name') {
-                    name = msg.data;
-                } else if (msg.type == 'my_color') {
-                    color = msg.data;
-                    cbox.value = "\#" + color.toString(16).padStart(6, "0");
-                } else if (msg.type == 'draw_tmp') {
-                    ctx.lineWidth = '0.5';
-                    drawOnCanvas(msg.color, msg.data, false);
-                } else if (msg.type == 'draw') {
-                    ctx.lineWidth = '3';
-                    drawOnCanvas(msg.color, msg.data, true);
-                } else if (msg.type == 'redraw') {
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
-                    ctx.lineWidth = '3';
-                    msg.data.forEach(function (item) {
-                        drawOnCanvas(item.color, item.data, true);
-                    });
-                }  
-            }
-
-            function connect() {
-                ws = new WebSocket(uri);
-                ws.onopen = function() {
-                    connected = true;
-                    chat.innerHTML = '<p><em>Connected!</em></p>';
-                    ws.send('{ "type": "get_name" }');
-                    ws.send('{ "type": "get_color" }');
-                    ws.send('{ "type": "redraw" }');
-                };
-    
-                ws.onmessage = function(msg) {
-                    message(msg.data);
-                };
-    
-                ws.onclose = function() {
-                    connected = false;
-                    chat.getElementsByTagName('em')[0].innerText = 'Disconnected!';
-                    setTimeout(connect(), 1000);
-                };
-            }
-
-            connect();
-
-            send.onclick = function() {
-                const msg = {
-                    name: name,
-                    type: 'text',
-                    data: text.value
-                };
-                ws.send(JSON.stringify(msg));
-                say('You', text.value);
-                text.value = '';
-            };
-
-            var canvas = document.getElementById('drawCanvas');
-            var ctx = canvas.getContext('2d');
-            ctx.lineWidth = '3';
-            canvas.addEventListener('mousedown', startDraw, false);
-            canvas.addEventListener('mousemove', draw, false);
-            canvas.addEventListener('mouseup', endDraw, false);
-            cbox.addEventListener('change', setcolor, false);
-            undo.addEventListener('click', function(e) {
-                ws.send(JSON.stringify({
-                    type: "undo",
-                }));
-            }, false);
-            redo.addEventListener('click', function(e) {
-                ws.send(JSON.stringify({
-                    type: "redo",
-                }));
-            }, false);
-            clear.addEventListener('click', function(e) {
-                ws.send(JSON.stringify({
-                    type: "clear",
-                }));
-            }, false);
-
-            // create a flag
-            var isActive = false;
-
-            // array to collect coordinates
-            var plots = [];
-            var plots_tmp = [];
-
-            function setcolor(e) {
-                ws.send(JSON.stringify({
-                    type: "set_color",
-                    data: cbox.value,
-                }));
-                ws.send('{ "type": "get_color" }');
-            }
-
-            function draw(e) {
-                if(!isActive || !connected) return;
-                // cross-browser canvas coordinates
-                var x = e.offsetX || e.layerX - canvas.offsetLeft;
-                var y = e.offsetY || e.layerY - canvas.offsetTop;
-
-                plots.push({x: x, y: y});
-                plots_tmp.push({x: x, y: y});
-                //drawOnCanvas(color, plots);
-                ws.send(JSON.stringify({
-                    type: "draw_tmp",
-                    color: color,
-                    data: plots_tmp
-                }));
-                while (plots_tmp.length > 2) {
-                    plots_tmp.shift();
-                }
-            }
-
-            function drawOnCanvas(color, plots) {
-                if (plots.length == 0) return;
-                ctx.beginPath();
-                ctx.moveTo(plots[0].x, plots[0].y);
-
-                for(var i=1; i<plots.length; i++) {
-                    ctx.lineTo(plots[i].x, plots[i].y);
-                }
-                ctx.strokeStyle = "\#" + color.toString(16).padStart(6, "0");
-                ctx.stroke();
-            }
-
-            function startDraw(e) {
-                isActive = true;
-                plots = [];
-                plots_tmp = [];
-                ctx.lineWidth = '0.5';
-            }
-
-            function endDraw(e) {
-                isActive = false;
-                ws.send(JSON.stringify({
-                    type: "draw",
-                    color: color,
-                    data: plots
-                }));
-                plots = [];
-                plots_tmp = [];
-            }
-        </script>
-    </body>
-</html>
-"#;

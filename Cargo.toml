@@ -13,3 +13,6 @@ pretty_env_logger = "0.4"
 pmem = { path = "../rust-pmem-master" }
 serde_json = "1.0"
 futures = { version = "0.3", default-features = false }
+md5 = "*"
+hex = "*"
+serde = { version = "1.0", features = ["derive"] }

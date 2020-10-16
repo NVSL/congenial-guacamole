@@ -169,7 +169,7 @@ where
         );
     }
 
-    pub fn or_insert(&mut self, key: &K, val: V, j: &Journal<P>)
+    pub fn or_insert(&mut self, key: &K, val: V, j: &Journal<P>) -> bool
     where
         K: PClone<P>,
     {
@@ -181,7 +181,7 @@ where
         for e in &*bucket {
             let e = e.borrow();
             if e.0 == *key {
-                return;
+                return false;
             }
         }
 
@@ -190,6 +190,7 @@ where
             LogRefCell::new((key.pclone(j), self.values.len() - 1), j),
             j,
         );
+        true
     }
 
     pub fn foreach<F: FnMut(&K, &V) -> ()>(&self, mut f: F) {
