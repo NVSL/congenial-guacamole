@@ -3,7 +3,9 @@
 This collaborative whiteboard uses Corundum to keep the history of actions in the persistent memory for each
 individual. Therefore, undoing and redoing actions is always possible. At the heart of the implementation,
 there is a WebSocket server that receives commands from clients and performs the operations as well as
-recording them in a persistent Key-Value store data structure.
+recording them in a persistent Key-Value store data structure. It doesn't use any database engines.
+Everything is stored in an `mmap`ed file and can be directly accessed via the defined data-structure to
+read and write.
 
 # Dependencies
 
