@@ -18,7 +18,7 @@ a soft link of `login` folder to `/var/www/html`.
 
 # How to run?
 
-First, change the config file `public_html/server.json` to the following:
+First, change the config file `login/server.json` to the following:
 
 ```json
 {
