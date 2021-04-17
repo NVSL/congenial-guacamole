@@ -4,13 +4,7 @@ use std::path::Path;
 use std::io::BufReader;
 use std::fs::File;
 use futures::{FutureExt, StreamExt};
-use pmem::alloc::*;
-use pmem::stm::Journal;
-use pmem::str::String as PString;
-use pmem::str::ToString;
-use pmem::sync::Pack;
-use pmem::sync::{Mutex as PMutex, Parc};
-use pmem::*;
+use corundum::default::*;
 use serde_json::{json, Result as Rslt, Value};
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -56,14 +50,14 @@ struct Server {
 }
 
 struct UserInfo {
-    username: PString<P>,
+    username: PString,
     password: [u8; 16],
     color: u32,
     history: History,
 }
 
 impl RootObj<P> for UserInfo {
-    fn init(j: &Journal<P>) -> Self {
+    fn init(j: &Journal) -> Self {
         UserInfo {
             username: Default::default(),
             password: Default::default(),
@@ -84,15 +78,15 @@ struct Database {
 }
 
 impl RootObj<P> for Database {
-    fn init(j: &Journal<P>) -> Self {
+    fn init(j: &Journal) -> Self {
         Database {
             data: RootObj::init(j)
         }
     }
 }
 
-type Root = Parc<PMutex<Database, P>, P>;
-type RootPack = Pack<PMutex<Database, P>, P>;
+type Root = Parc<PMutex<Database>>;
+type RootPack = parc::VWeak<PMutex<Database>>;
 
 fn read_user_from_file<P: AsRef<Path>>(path: P) -> Result<Server, Box<dyn std::error::Error>> {
     // Open the file in read-only mode with buffer.
@@ -116,8 +110,8 @@ async fn main() {
     // Turn our "state" into a new Filter...
     let users = warp::any().map(move || users.clone());
 
-    let info = P::open::<Root>("users.pool", PO_CFNE | PO_2GB).unwrap();
-    let pack = info.pack();
+    let info = P::open::<Root>("users.pool", O_CFNE | O_2GB).unwrap();
+    let pack = info.demote();
     let db = warp::any().map(move || pack.clone());
     // GET /wb -> websocket upgrade
     let wb = warp::path("wb")
@@ -213,7 +207,7 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
             let tx = &users.read().await[&my_id];
             let tx = AssertTxInSafe(tx);
             return P::transaction(|j| {
-                if let Some(root) = root.unpack(j) {
+                if let Some(root) = root.promote(j) {
                     let mut root = root.lock(j);
                     let name = v["username"].as_str().unwrap();
                     let pass = v["password"].as_str().unwrap();
@@ -225,7 +219,7 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
                     if let Some(u) = root.data.get_ref(user_id) {
                         if u.password == password {
                             println!("Logged in");
-                            if let Err(disconnected) = tx.send(Ok(Message::text(format!(
+                            if let Err(disconnected) = tx.0.send(Ok(Message::text(format!(
                                 "{{\"type\": \"login\", \"user\": \"{}\", \"name\": \"{}\", \"color\": \"{}\"}}",
                                 user.encode_hex::<String>(), u.username, u.color
                             )))) {
@@ -234,7 +228,7 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
                             user_id
                         } else {
                             println!("Wrong password");
-                            if let Err(disconnected) = tx.send(Ok(Message::text(format!(
+                            if let Err(disconnected) = tx.0.send(Ok(Message::text(format!(
                                 "{{\"type\": \"wrong\"}}"
                             )))) {
                                 eprintln!("User<#{}> is disconnected!", disconnected);
@@ -255,7 +249,7 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
                         user_id
                     } else {
                         println!("User doesn't exist");
-                        if let Err(disconnected) = tx.send(Ok(Message::text(format!(
+                        if let Err(disconnected) = tx.0.send(Ok(Message::text(format!(
                             "{{\"type\": \"not_exists\"}}"
                         )))) {
                             eprintln!("User<#{}> is disconnected!", disconnected);
@@ -265,19 +259,17 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
                 } else {
                     user
                 }
-            })
-            .unwrap();
+            }).unwrap();
         } else if cmd == "set_user" {
             let user = *compute(v["data"].as_str().unwrap());
             let tx = &users.read().await[&my_id];
-            let tx = AssertTxInSafe(tx);
-            match P::transaction(|j| {
-                if let Some(root) = root.unpack(j) {
+            match P::transaction(AssertTxInSafe(|j| {
+                if let Some(root) = root.promote(j) {
                     if let Some(u) = root.lock(j).data.get_ref(user) {
                         u.color
                     } else { 0 }
                 } else { 0 }
-            }) {
+            })) {
                 Err(e) => eprintln!("Error: {}", e),
                 Ok(c) => {
                     let _ = tx.send(Ok(Message::text(
@@ -290,7 +282,7 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
             return user;
         } else if cmd == "set_color" {
             if let Err(e) = P::transaction(|j| {
-                if let Some(root) = root.unpack(j) {
+                if let Some(root) = root.promote(j) {
                     let s = &v["data"].as_str().unwrap()[1..];
                     let c = u32::from_str_radix(s, 16).unwrap();
                     if !root.lock(j).data.update_inplace_mut(&user, j, |w| w.color = c) {
@@ -306,7 +298,7 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
             } else {
                 P::transaction(|j| {
                     let mut done = false;
-                    if let Some(root) = root.unpack(j) {
+                    if let Some(root) = root.promote(j) {
                         if !root.lock(j).data.update_inplace(&user, |w| {
                             done = if cmd == "clear" {
                                 w.history.clear()
@@ -326,11 +318,11 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
                 if done {
                     if let Ok(msg) = P::transaction(|j| {
                         let mut global_history = BTreeMap::<SystemTime, Value>::new();
-                        if let Some(root) = root.unpack(j) {
+                        if let Some(root) = root.promote(j) {
                             root.lock(j).data.foreach(|_, root| {
                                 let mut curr = root.history.head();
                                 let last = root.history.last_timestamp(j);
-                                while let Some(item) = curr.upgrade(j) {
+                                while let Some(item) = curr.promote(j) {
                                     if item.timestamp() <= last {
                                         global_history.insert(item.timestamp(), item.as_json());
                                     } else {
@@ -375,7 +367,7 @@ async fn user_message(my_id: usize, user: [u8; 16], msg: Message, users: &Users,
                             ));
                         }
                         if let Err(e) = P::transaction(|j| {
-                            if let Some(root) = root.unpack(j) {
+                            if let Some(root) = root.promote(j) {
                                 let root = root.lock(j);
                                 let c = if let Some(r) = root.data.get_ref(user) {
                                     r.color

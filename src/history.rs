@@ -1,24 +1,18 @@
 
 
 use serde_json::*;
-use pmem::stm::Journal;
-use pmem::RootObj;
 use std::time::SystemTime;
-use pmem::prc::VWeak;
-use pmem::cell::LogRefCell;
-use pmem::prc::Weak;
-use pmem::prc::Prc;
-use pmem::vec::Vec as PVec;
-use pmem::alloc::*;
+use corundum::default::*;
+use prc::*;
 
 pub type P = BuddyAlloc;
 
 pub struct Line {
     ts: SystemTime,
-    next: LogRefCell<Option<Prc<Line,P>>,P>,
-    prev: Weak<Line,P>,
+    next: PRefCell<Option<Prc<Line>>>,
+    prev: PWeak<Line>,
     color: u32,
-    points: PVec<(i32,i32),P>
+    points: PVec<(i32,i32)>
 }
 
 impl Line {
@@ -33,10 +27,10 @@ impl Line {
         })
     }
 
-    pub fn next(&self) -> VWeak<Line, P> {
+    pub fn next(&self) -> VWeak<Line> {
         let n = self.next.borrow();
         if let Some(n) = &*n {
-            n.volatile()
+            Prc::demote(n)
         } else {
             VWeak::null()
         }
@@ -55,28 +49,20 @@ impl Line {
     }
 }
 
+#[derive(Root)]
 pub struct History {
-    head: LogRefCell<Option<Prc<Line,P>>,P>,
-    current: LogRefCell<Weak<Line,P>,P>,
-}
-
-impl RootObj<P> for History {
-    fn init(j: &Journal<P>) -> Self {
-        History {
-            head: LogRefCell::new(None, j),
-            current: LogRefCell::new(Weak::new(), j)
-        }
-    }
+    head: PRefCell<Option<Prc<Line>>>,
+    current: PRefCell<PWeak<Line>>,
 }
 
 impl History {
-    pub fn add(&self, j: &Journal<P>, points: &[(i32,i32)], color: u32) {
+    pub fn add(&self, j: &Journal, points: &[(i32,i32)], color: u32) {
         let mut current = self.current.borrow_mut(j);
         if let Some(curr) = current.upgrade(j) {
             let mut next = curr.next.borrow_mut(j);
             let new = Prc::new(Line {
                 ts: SystemTime::now(),
-                next: LogRefCell::new(None, j),
+                next: PRefCell::new(None),
                 prev: Prc::downgrade(&curr, j),
                 color,
                 points: PVec::from_slice(points, j)
@@ -87,8 +73,8 @@ impl History {
             let mut head = self.head.borrow_mut(j);
             let new = Prc::new(Line {
                 ts: SystemTime::now(),
-                next: LogRefCell::new(None, j),
-                prev: Weak::new(),
+                next: PRefCell::new(None),
+                prev: PWeak::new(),
                 color,
                 points: PVec::from_slice(points, j)
             }, j);
@@ -104,7 +90,7 @@ impl History {
                 *current = if let Some(prev) = &curr.prev.upgrade(j) {
                     Prc::downgrade(prev, j)
                 } else {
-                    Weak::new()
+                    PWeak::new()
                 };
                 true
             } else {
@@ -138,20 +124,20 @@ impl History {
             let mut head  = self.head.borrow_mut(j);
             let res = head.is_some();
             *head = None;
-            *current = Weak::new();
+            *current = PWeak::new();
             res
         }).unwrap()
     }
 
-    pub fn head(&self) -> VWeak<Line,P> {
+    pub fn head(&self) -> VWeak<Line> {
         if let Some(head) = &*self.head.borrow() {
-            head.volatile()
+            Prc::demote(head)
         } else {
             VWeak::null()
         }
     }
 
-    pub fn last_timestamp(&self, j: &Journal<P>) -> SystemTime {
+    pub fn last_timestamp(&self, j: &Journal) -> SystemTime {
         if let Some(last) = self.current.borrow().upgrade(j) {
             last.ts
         } else {

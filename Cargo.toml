@@ -15,4 +15,4 @@ futures = { version = "0.3", default-features = false }
 md5 = "*"
 hex = "*"
 serde = { version = "1.0", features = ["derive"] }
-pmem = { path = "../rust-pmem-master" }
+corundum = { path = "../rust-pmem" }
